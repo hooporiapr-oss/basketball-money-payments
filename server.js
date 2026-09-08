@@ -25,6 +25,12 @@ const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const app = express();
 
+// Where card links point. Set CARD_BASE_URL in Render to your public
+// site (e.g. https://cashflowhoops.com). No trailing slash.
+const CARD_BASE_URL = (process.env.CARD_BASE_URL || 'https://cashflowhoops.com').replace(/\/$/, '');
+const MAIL_FROM = process.env.MAIL_FROM || 'Basketball Money <onboarding@resend.dev>';
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+
 // Stripe's webhook needs the raw, unparsed body to verify its
 // signature, so this route is declared BEFORE express.json() and
 // handles its own raw body. Moving this below express.json() breaks
@@ -63,11 +69,20 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     // not from anything that travelled through the browser.
     const { data: design, error: designErr } = await supabase
       .from('card_designs')
-      .select('id, tab_count, price, team_share_pct')
+      .select('id, tab_count, price, team_share_pct, offer_text, merchants(name)')
       .eq('id', designId)
       .single();
 
     if (designErr || !design) throw designErr || new Error('Design not found');
+
+    design.merchant_name = design.merchants?.name || 'Basketball Money';
+
+    // player name, for the email copy only
+    design.player_name = null;
+    if (playerId) {
+      const { data: p } = await supabase.from('players').select('name').eq('id', playerId).single();
+      if (p) design.player_name = p.name;
+    }
 
     const pricePaid = Number(session.amount_total) / 100;
     const teamAmount = +(pricePaid * (design.team_share_pct / 100)).toFixed(2);
@@ -114,6 +129,30 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     if (tabsErr) throw tabsErr;
 
     console.log(`Card ${card.card_token} created — ${design.tab_count} tabs, $${teamAmount} to team, payment ${session.id}`);
+
+    // Email the buyer their card link. Deliberately after the card
+    // exists and wrapped in its own try/catch: a mail outage must
+    // never make this webhook fail and trigger a Stripe retry on a
+    // card that was already created.
+    if (buyerEmail) {
+      try {
+        await sendCardEmail({
+          to: buyerEmail,
+          buyerName,
+          token: card.card_token,
+          merchantName: design.merchant_name,
+          offerText: design.offer_text,
+          tabCount: design.tab_count,
+          playerName: design.player_name,
+        });
+        console.log(`Card link emailed to ${buyerEmail}`);
+      } catch (mailErr) {
+        console.error('Card created but email failed:', mailErr.message);
+      }
+    } else {
+      console.log('No buyer email on session — card link not emailed');
+    }
+
     res.status(200).send('ok');
   } catch (e) {
     console.error('Could not create card after payment:', e);
@@ -191,6 +230,65 @@ app.post('/create-checkout-session', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.send('Basketball Money payment server is running.'));
+
+// Sends the card link by email through Resend's HTTP API. No extra
+// npm package needed — Node 18+ has fetch built in.
+async function sendCardEmail({ to, buyerName, token, merchantName, offerText, tabCount, playerName }) {
+  if (!RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
+
+  const link = `${CARD_BASE_URL}/?card=${token}`;
+  const supporting = playerName ? ` supporting ${playerName}` : '';
+
+  const html = `
+  <div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:520px;margin:0 auto;padding:24px;color:#1a1a1a;">
+    <h1 style="font-size:22px;margin:0 0 6px;">Your ${merchantName} card is ready</h1>
+    <p style="margin:0 0 18px;color:#666;font-size:14px;">Thanks${buyerName ? ', ' + buyerName : ''} — your purchase${supporting} is confirmed.</p>
+
+    <div style="border:1px solid #e3e3e3;border-radius:12px;padding:18px;margin-bottom:20px;">
+      <p style="margin:0 0 4px;font-size:13px;color:#666;">${tabCount} coupon tabs</p>
+      <p style="margin:0 0 12px;font-size:17px;font-weight:700;">${offerText}</p>
+      <p style="margin:0;font-size:13px;color:#666;">Card code</p>
+      <p style="margin:2px 0 0;font-family:monospace;font-size:20px;font-weight:700;letter-spacing:1px;">${token}</p>
+    </div>
+
+    <a href="${link}" style="display:inline-block;background:#5b2377;color:#fff;text-decoration:none;padding:13px 26px;border-radius:9px;font-weight:700;">Open my card</a>
+
+    <p style="margin:20px 0 6px;font-size:13px;color:#666;">Or paste this link into your browser:</p>
+    <p style="margin:0;font-size:12px;word-break:break-all;color:#5b2377;">${link}</p>
+
+    <p style="margin:24px 0 0;font-size:12px;color:#888;line-height:1.5;">
+      Save this email — this link is how you open your card. At the register, tap a coupon to peel it, then hand your phone to the cashier.
+    </p>
+  </div>`;
+
+  const text = `Your ${merchantName} card is ready.
+
+Card code: ${token}
+${tabCount} coupon tabs — ${offerText}
+
+Open your card: ${link}
+
+Save this email. At the register, tap a coupon to peel it, then hand your phone to the cashier.`;
+
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: MAIL_FROM,
+      to: [to],
+      subject: `Your ${merchantName} BOGO card — code ${token}`,
+      html,
+      text,
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Resend ${res.status}: ${await res.text()}`);
+  }
+}
 
 function randToken() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
