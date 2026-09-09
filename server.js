@@ -84,33 +84,50 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       if (p) design.player_name = p.name;
     }
 
-    const pricePaid = Number(session.amount_total) / 100;
+    // How many cards were bought. Read from the line item so it is
+    // Stripe's own record, not anything the browser claimed.
+    let quantity = 1;
+    try {
+      const items = await stripe.checkout.sessions.listLineItems(session.id, { limit: 1 });
+      quantity = items.data[0]?.quantity || 1;
+    } catch (e) {
+      console.error('Could not read quantity, defaulting to 1:', e.message);
+    }
+
+    // amount_total covers every card, so divide to get the per-card
+    // price before splitting it.
+    const totalPaid = Number(session.amount_total) / 100;
+    const pricePaid = +(totalPaid / quantity).toFixed(2);
     const teamAmount = +(pricePaid * (design.team_share_pct / 100)).toFixed(2);
     const platformAmount = +(pricePaid - teamAmount).toFixed(2);
 
-    const { data: card, error: cardErr } = await supabase
+    // One row per card, each with its own token. card_index makes the
+    // rows distinct within the session, so a repeated webhook delivery
+    // still collides on the unique constraint instead of duplicating.
+    const cardRows = Array.from({ length: quantity }, (_, i) => ({
+      design_id: design.id,
+      campaign_id: campaignId,
+      player_id: playerId || null,
+      card_token: randToken(),
+      card_index: i + 1,
+      buyer_name: buyerName,
+      buyer_email: buyerEmail,
+      price_paid: pricePaid,
+      team_amount: teamAmount,
+      platform_amount: platformAmount,
+      payment_status: 'paid',
+      stripe_session_id: session.id,
+    }));
+
+    const { data: cards, error: cardErr } = await supabase
       .from('cards')
-      .insert({
-        design_id: design.id,
-        campaign_id: campaignId,
-        player_id: playerId || null,
-        card_token: randToken(),
-        buyer_name: buyerName,
-        buyer_email: buyerEmail,
-        price_paid: pricePaid,
-        team_amount: teamAmount,
-        platform_amount: platformAmount,
-        payment_status: 'paid',
-        stripe_session_id: session.id,
-      })
-      .select()
-      .single();
+      .insert(cardRows)
+      .select();
 
     if (cardErr) {
       // 23505 = unique violation. Stripe delivers the same event more
-      // than once by design. This session already has a card, so this
-      // is not a failure — acknowledge and stop rather than creating
-      // a duplicate.
+      // than once by design. This session's cards already exist, so
+      // this is not a failure — acknowledge and stop.
       if (cardErr.code === '23505') {
         console.log(`Session ${session.id} already processed, skipping`);
         return res.status(200).send('ok (already processed)');
@@ -118,17 +135,21 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       throw cardErr;
     }
 
-    // One row per coupon tab, numbered from 1, all sealed.
-    const tabRows = Array.from({ length: design.tab_count }, (_, i) => ({
-      card_id: card.id,
-      tab_number: i + 1,
-      status: 'sealed',
-    }));
+    // Every tab for every card, inserted in one request rather than
+    // one per tab. A 32-tab card at quantity 5 is 160 rows.
+    const tabRows = [];
+    for (const c of cards) {
+      for (let i = 0; i < design.tab_count; i++) {
+        tabRows.push({ card_id: c.id, tab_number: i + 1, status: 'sealed' });
+      }
+    }
 
     const { error: tabsErr } = await supabase.from('card_tabs').insert(tabRows);
     if (tabsErr) throw tabsErr;
 
-    console.log(`Card ${card.card_token} created — ${design.tab_count} tabs, $${teamAmount} to team, payment ${session.id}`);
+    const card = cards[0];
+
+    console.log(`${cards.length} card(s) created — ${cards.map(c => c.card_token).join(', ')} — ${design.tab_count} tabs each, $${(teamAmount * cards.length).toFixed(2)} to team, payment ${session.id}`);
 
     // Email the buyer their card link. Deliberately after the card
     // exists and wrapped in its own try/catch: a mail outage must
@@ -139,7 +160,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         await sendCardEmail({
           to: buyerEmail,
           buyerName,
-          token: card.card_token,
+          tokens: cards.map(c => c.card_token),
           merchantName: design.merchant_name,
           offerText: design.offer_text,
           tabCount: design.tab_count,
@@ -174,9 +195,13 @@ app.use((req, res, next) => {
 
 app.post('/create-checkout-session', async (req, res) => {
   try {
-    const { design_id, campaign_id, player_id, buyer_name, success_url, cancel_url } = req.body;
+    const { design_id, campaign_id, player_id, buyer_name, quantity, success_url, cancel_url } = req.body;
     if (!design_id) return res.status(400).json({ error: 'design_id is required' });
     if (!campaign_id) return res.status(400).json({ error: 'campaign_id is required' });
+
+    // Clamp to something sane. The real quantity is read back from
+    // Stripe in the webhook, so this is only the starting value.
+    const qty = Math.min(Math.max(parseInt(quantity, 10) || 1, 1), 20);
 
     // Price comes from the database, never from the browser.
     const { data: design, error: designErr } = await supabase
@@ -210,7 +235,8 @@ app.post('/create-checkout-session', async (req, res) => {
           },
           unit_amount: Math.round(Number(design.price) * 100),
         },
-        quantity: 1,
+        quantity: qty,
+        adjustable_quantity: { enabled: true, minimum: 1, maximum: 20 },
       }],
       metadata: {
         design_id: String(design_id),
@@ -233,42 +259,45 @@ app.get('/', (req, res) => res.send('Basketball Money payment server is running.
 
 // Sends the card link by email through Resend's HTTP API. No extra
 // npm package needed — Node 18+ has fetch built in.
-async function sendCardEmail({ to, buyerName, token, merchantName, offerText, tabCount, playerName }) {
+async function sendCardEmail({ to, buyerName, tokens, merchantName, offerText, tabCount, playerName }) {
   if (!RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
 
-  const link = `${CARD_BASE_URL}/?card=${token}`;
+  const list = Array.isArray(tokens) ? tokens : [tokens];
+  const many = list.length > 1;
+  const linkFor = (tk) => `${CARD_BASE_URL}/?card=${tk}`;
   const supporting = playerName ? ` supporting ${playerName}` : '';
 
-  const html = `
-  <div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:520px;margin:0 auto;padding:24px;color:#1a1a1a;">
-    <h1 style="font-size:22px;margin:0 0 6px;">Your ${merchantName} card is ready</h1>
-    <p style="margin:0 0 18px;color:#666;font-size:14px;">Thanks${buyerName ? ', ' + buyerName : ''} — your purchase${supporting} is confirmed.</p>
-
-    <div style="border:1px solid #e3e3e3;border-radius:12px;padding:18px;margin-bottom:20px;">
+  const cardBlocks = list.map((tk, i) => `
+    <div style="border:1px solid #e3e3e3;border-radius:12px;padding:18px;margin-bottom:14px;">
+      ${many ? `<p style="margin:0 0 8px;font-size:12px;color:#888;text-transform:uppercase;letter-spacing:.5px;">Card ${i + 1} of ${list.length}</p>` : ''}
       <p style="margin:0 0 4px;font-size:13px;color:#666;">${tabCount} coupon tabs</p>
       <p style="margin:0 0 12px;font-size:17px;font-weight:700;">${offerText}</p>
       <p style="margin:0;font-size:13px;color:#666;">Card code</p>
-      <p style="margin:2px 0 0;font-family:monospace;font-size:20px;font-weight:700;letter-spacing:1px;">${token}</p>
-    </div>
+      <p style="margin:2px 0 14px;font-family:monospace;font-size:20px;font-weight:700;letter-spacing:1px;">${tk}</p>
+      <a href="${linkFor(tk)}" style="display:inline-block;background:#5b2377;color:#fff;text-decoration:none;padding:11px 22px;border-radius:9px;font-weight:700;font-size:14px;">Open this card</a>
+      <p style="margin:12px 0 0;font-size:11px;word-break:break-all;color:#5b2377;">${linkFor(tk)}</p>
+    </div>`).join('');
 
-    <a href="${link}" style="display:inline-block;background:#5b2377;color:#fff;text-decoration:none;padding:13px 26px;border-radius:9px;font-weight:700;">Open my card</a>
+  const html = `
+  <div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:520px;margin:0 auto;padding:24px;color:#1a1a1a;">
+    <h1 style="font-size:22px;margin:0 0 6px;">${many ? `Your ${list.length} ${merchantName} cards are ready` : `Your ${merchantName} card is ready`}</h1>
+    <p style="margin:0 0 18px;color:#666;font-size:14px;">Thanks${buyerName ? ', ' + buyerName : ''} — your purchase${supporting} is confirmed.</p>
 
-    <p style="margin:20px 0 6px;font-size:13px;color:#666;">Or paste this link into your browser:</p>
-    <p style="margin:0;font-size:12px;word-break:break-all;color:#5b2377;">${link}</p>
+    ${cardBlocks}
 
-    <p style="margin:24px 0 0;font-size:12px;color:#888;line-height:1.5;">
-      Save this email — this link is how you open your card. At the register, tap a coupon to peel it, then hand your phone to the cashier.
+    <p style="margin:22px 0 0;font-size:12px;color:#888;line-height:1.5;">
+      Save this email — ${many ? 'these links are' : 'this link is'} how you open your ${many ? 'cards' : 'card'}.${many ? ' Each card is separate, so you can forward a link to whoever you are giving it to.' : ''}
+      At the register, tap a coupon to peel it, then hand your phone to the cashier.
     </p>
   </div>`;
 
-  const text = `Your ${merchantName} card is ready.
+  const text = `${many ? `Your ${list.length} ${merchantName} cards are ready.` : `Your ${merchantName} card is ready.`}
 
-Card code: ${token}
+${list.map((tk, i) => `${many ? `Card ${i + 1} of ${list.length}\n` : ''}Code: ${tk}
 ${tabCount} coupon tabs — ${offerText}
+Open: ${linkFor(tk)}`).join('\n\n')}
 
-Open your card: ${link}
-
-Save this email. At the register, tap a coupon to peel it, then hand your phone to the cashier.`;
+Save this email.${many ? ' Each card is separate — forward a link to whoever you are giving it to.' : ''} At the register, tap a coupon to peel it, then hand your phone to the cashier.`;
 
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
@@ -279,7 +308,9 @@ Save this email. At the register, tap a coupon to peel it, then hand your phone 
     body: JSON.stringify({
       from: MAIL_FROM,
       to: [to],
-      subject: `Your ${merchantName} BOGO card — code ${token}`,
+      subject: many
+        ? `Your ${list.length} ${merchantName} BOGO cards are ready`
+        : `Your ${merchantName} BOGO card — code ${list[0]}`,
       html,
       text,
     }),
