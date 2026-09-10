@@ -72,7 +72,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     // not from anything that travelled through the browser.
     const { data: design, error: designErr } = await supabase
       .from('card_designs')
-      .select('id, tab_count, price, team_share_pct, offer_text, expires_on, merchants(name)')
+      .select('id, tab_count, price, team_share_pct, offer_text, valid_when, expires_on, merchants(name)')
       .eq('id', designId)
       .single();
 
@@ -176,6 +176,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           tokens: cards.map(c => c.card_token),
           merchantName: design.merchant_name,
           offerText: design.offer_text,
+          validWhen: design.valid_when,
           tabCount: design.tab_count,
           playerName: design.player_name,
           expiresOn,
@@ -273,7 +274,7 @@ app.get('/', (req, res) => res.send('Basketball Money payment server is running.
 
 // Sends the card link by email through Resend's HTTP API. No extra
 // npm package needed — Node 18+ has fetch built in.
-async function sendCardEmail({ to, buyerName, tokens, merchantName, offerText, tabCount, playerName, expiresOn }) {
+async function sendCardEmail({ to, buyerName, tokens, merchantName, offerText, validWhen, tabCount, playerName, expiresOn }) {
   if (!RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
 
   const list = Array.isArray(tokens) ? tokens : [tokens];
@@ -285,7 +286,8 @@ async function sendCardEmail({ to, buyerName, tokens, merchantName, offerText, t
     <div style="border:1px solid #e3e3e3;border-radius:12px;padding:18px;margin-bottom:14px;">
       ${many ? `<p style="margin:0 0 8px;font-size:12px;color:#888;text-transform:uppercase;letter-spacing:.5px;">Card ${i + 1} of ${list.length}</p>` : ''}
       <p style="margin:0 0 4px;font-size:13px;color:#666;">${tabCount} coupon tabs</p>
-      <p style="margin:0 0 12px;font-size:17px;font-weight:700;">${offerText}</p>
+      <p style="margin:0 0 4px;font-size:17px;font-weight:700;">${offerText}</p>
+      ${validWhen ? `<p style="margin:0 0 12px;font-size:13px;color:#8a5a00;font-weight:600;">${validWhen}</p>` : '<div style="height:8px"></div>'}
       <p style="margin:0;font-size:13px;color:#666;">Card code</p>
       <p style="margin:2px 0 14px;font-family:monospace;font-size:20px;font-weight:700;letter-spacing:1px;">${tk}</p>
       <a href="${linkFor(tk)}" style="display:inline-block;background:#5b2377;color:#fff;text-decoration:none;padding:11px 22px;border-radius:9px;font-weight:700;font-size:14px;">Open this card</a>
@@ -308,7 +310,7 @@ async function sendCardEmail({ to, buyerName, tokens, merchantName, offerText, t
   const text = `${many ? `Your ${list.length} ${merchantName} cards are ready.` : `Your ${merchantName} card is ready.`}
 
 ${list.map((tk, i) => `${many ? `Card ${i + 1} of ${list.length}\n` : ''}Code: ${tk}
-${tabCount} coupon tabs — ${offerText}
+${tabCount} coupon tabs — ${offerText}${validWhen ? ' (' + validWhen + ')' : ''}
 Open: ${linkFor(tk)}`).join('\n\n')}
 
 ${expiresOn ? `Valid through ${expiresOn}.\n` : ''}Save this email.${many ? ' Each card is separate — forward a link to whoever you are giving it to.' : ''} At the register, tap a coupon to peel it, then hand your phone to the cashier.`;
