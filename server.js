@@ -29,6 +29,9 @@ const app = express();
 // site (e.g. https://cashflowhoops.com). No trailing slash.
 const CARD_BASE_URL = (process.env.CARD_BASE_URL || 'https://cashflowhoops.com').replace(/\/$/, '');
 const MAIL_FROM = process.env.MAIL_FROM || 'Basketball Money <onboarding@resend.dev>';
+// Card emails come from a send-only address. Replies need somewhere
+// real to land, so point them at an inbox that is actually read.
+const MAIL_REPLY_TO = process.env.MAIL_REPLY_TO || '';
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 
 // Stripe's webhook needs the raw, unparsed body to verify its
@@ -307,6 +310,7 @@ Save this email.${many ? ' Each card is separate — forward a link to whoever y
     },
     body: JSON.stringify({
       from: MAIL_FROM,
+      ...(MAIL_REPLY_TO ? { reply_to: MAIL_REPLY_TO } : {}),
       to: [to],
       subject: many
         ? `Your ${list.length} ${merchantName} BOGO cards are ready`
