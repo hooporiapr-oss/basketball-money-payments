@@ -72,7 +72,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     // not from anything that travelled through the browser.
     const { data: design, error: designErr } = await supabase
       .from('card_designs')
-      .select('id, tab_count, price, team_share_pct, offer_text, merchants(name)')
+      .select('id, tab_count, price, team_share_pct, offer_text, expires_on, merchants(name)')
       .eq('id', designId)
       .single();
 
@@ -107,8 +107,18 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     // One row per card, each with its own token. card_index makes the
     // rows distinct within the session, so a repeated webhook delivery
     // still collides on the unique constraint instead of duplicating.
+    // A card lasts a year from purchase, unless the merchant set an
+    // earlier end date on the design — then whichever comes first.
+    const oneYear = new Date();
+    oneYear.setFullYear(oneYear.getFullYear() + 1);
+    let expiresOn = oneYear.toISOString().slice(0, 10);
+    if (design.expires_on && design.expires_on < expiresOn) {
+      expiresOn = design.expires_on;
+    }
+
     const cardRows = Array.from({ length: quantity }, (_, i) => ({
       design_id: design.id,
+      expires_on: expiresOn,
       campaign_id: campaignId,
       player_id: playerId || null,
       card_token: randToken(),
@@ -168,6 +178,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           offerText: design.offer_text,
           tabCount: design.tab_count,
           playerName: design.player_name,
+          expiresOn,
         });
         console.log(`Card link emailed to ${buyerEmail}`);
       } catch (mailErr) {
@@ -262,7 +273,7 @@ app.get('/', (req, res) => res.send('Basketball Money payment server is running.
 
 // Sends the card link by email through Resend's HTTP API. No extra
 // npm package needed — Node 18+ has fetch built in.
-async function sendCardEmail({ to, buyerName, tokens, merchantName, offerText, tabCount, playerName }) {
+async function sendCardEmail({ to, buyerName, tokens, merchantName, offerText, tabCount, playerName, expiresOn }) {
   if (!RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
 
   const list = Array.isArray(tokens) ? tokens : [tokens];
@@ -289,7 +300,7 @@ async function sendCardEmail({ to, buyerName, tokens, merchantName, offerText, t
     ${cardBlocks}
 
     <p style="margin:22px 0 0;font-size:12px;color:#888;line-height:1.5;">
-      Save this email — ${many ? 'these links are' : 'this link is'} how you open your ${many ? 'cards' : 'card'}.${many ? ' Each card is separate, so you can forward a link to whoever you are giving it to.' : ''}
+      ${expiresOn ? `Valid through ${expiresOn}. ` : ''}Save this email — ${many ? 'these links are' : 'this link is'} how you open your ${many ? 'cards' : 'card'}.${many ? ' Each card is separate, so you can forward a link to whoever you are giving it to.' : ''}
       At the register, tap a coupon to peel it, then hand your phone to the cashier.
     </p>
   </div>`;
@@ -300,7 +311,7 @@ ${list.map((tk, i) => `${many ? `Card ${i + 1} of ${list.length}\n` : ''}Code: $
 ${tabCount} coupon tabs — ${offerText}
 Open: ${linkFor(tk)}`).join('\n\n')}
 
-Save this email.${many ? ' Each card is separate — forward a link to whoever you are giving it to.' : ''} At the register, tap a coupon to peel it, then hand your phone to the cashier.`;
+${expiresOn ? `Valid through ${expiresOn}.\n` : ''}Save this email.${many ? ' Each card is separate — forward a link to whoever you are giving it to.' : ''} At the register, tap a coupon to peel it, then hand your phone to the cashier.`;
 
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
