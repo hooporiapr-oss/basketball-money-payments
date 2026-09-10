@@ -72,7 +72,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     // not from anything that travelled through the browser.
     const { data: design, error: designErr } = await supabase
       .from('card_designs')
-      .select('id, tab_count, price, team_share_pct, offer_text, valid_when, expires_on, merchants(name)')
+      .select('id, tab_count, price, team_share_pct, offer_text, valid_when, expires_on, kind, license_product, redeem_url, merchants(name)')
       .eq('id', designId)
       .single();
 
@@ -148,17 +148,34 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       throw cardErr;
     }
 
-    // Every tab for every card, inserted in one request rather than
-    // one per tab. A 32-tab card at quantity 5 is 160 rows.
-    const tabRows = [];
-    for (const c of cards) {
-      for (let i = 0; i < design.tab_count; i++) {
-        tabRows.push({ card_id: c.id, tab_number: i + 1, status: 'sealed' });
-      }
-    }
+    if (design.kind === 'license') {
+      // A license has no coupons. Each purchased card becomes a row in
+      // the shared licenses table, so the product's own gate accepts it
+      // with no integration between the two systems.
+      const licenseRows = cards.map(c => ({
+        code: c.card_token,
+        product: design.license_product,
+        school_name: buyerName || 'Supporter',
+        expires_at: c.expires_on,
+        active: true,
+        notes: 'Purchased through Basketball Money'
+      }));
 
-    const { error: tabsErr } = await supabase.from('card_tabs').insert(tabRows);
-    if (tabsErr) throw tabsErr;
+      const { error: licErr } = await supabase.from('licenses').insert(licenseRows);
+      if (licErr) throw licErr;
+    } else {
+      // Every tab for every card, inserted in one request rather than
+      // one per tab. A 32-tab card at quantity 5 is 160 rows.
+      const tabRows = [];
+      for (const c of cards) {
+        for (let i = 0; i < design.tab_count; i++) {
+          tabRows.push({ card_id: c.id, tab_number: i + 1, status: 'sealed' });
+        }
+      }
+
+      const { error: tabsErr } = await supabase.from('card_tabs').insert(tabRows);
+      if (tabsErr) throw tabsErr;
+    }
 
     const card = cards[0];
 
@@ -180,6 +197,8 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           tabCount: design.tab_count,
           playerName: design.player_name,
           expiresOn,
+          kind: design.kind,
+          redeemUrl: design.redeem_url,
         });
         console.log(`Card link emailed to ${buyerEmail}`);
       } catch (mailErr) {
@@ -274,7 +293,7 @@ app.get('/', (req, res) => res.send('Basketball Money payment server is running.
 
 // Sends the card link by email through Resend's HTTP API. No extra
 // npm package needed — Node 18+ has fetch built in.
-async function sendCardEmail({ to, buyerName, tokens, merchantName, offerText, validWhen, tabCount, playerName, expiresOn }) {
+async function sendCardEmail({ to, buyerName, tokens, merchantName, offerText, validWhen, tabCount, playerName, expiresOn, kind, redeemUrl }) {
   if (!RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
 
   const list = Array.isArray(tokens) ? tokens : [tokens];
@@ -282,7 +301,17 @@ async function sendCardEmail({ to, buyerName, tokens, merchantName, offerText, v
   const linkFor = (tk) => `${CARD_BASE_URL}/?card=${tk}`;
   const supporting = playerName ? ` supporting ${playerName}` : '';
 
-  const cardBlocks = list.map((tk, i) => `
+  const isLicense = kind === 'license';
+
+  const cardBlocks = isLicense ? list.map((tk, i) => `
+    <div style="border:1px solid #e3e3e3;border-radius:12px;padding:18px;margin-bottom:14px;">
+      ${many ? `<p style="margin:0 0 8px;font-size:12px;color:#888;text-transform:uppercase;letter-spacing:.5px;">Access ${i + 1} of ${list.length}</p>` : ''}
+      <p style="margin:0 0 4px;font-size:13px;color:#666;">One year of access</p>
+      <p style="margin:0;font-size:13px;color:#666;">Your access code</p>
+      <p style="margin:2px 0 14px;font-family:monospace;font-size:22px;font-weight:700;letter-spacing:2px;">${tk}</p>
+      ${redeemUrl ? `<a href="${redeemUrl}" style="display:inline-block;background:#5b2377;color:#fff;text-decoration:none;padding:11px 22px;border-radius:9px;font-weight:700;font-size:14px;">Open ${merchantName}</a>
+      <p style="margin:12px 0 0;font-size:11px;word-break:break-all;color:#5b2377;">${redeemUrl}</p>` : ''}
+    </div>`).join('') : list.map((tk, i) => `
     <div style="border:1px solid #e3e3e3;border-radius:12px;padding:18px;margin-bottom:14px;">
       ${many ? `<p style="margin:0 0 8px;font-size:12px;color:#888;text-transform:uppercase;letter-spacing:.5px;">Card ${i + 1} of ${list.length}</p>` : ''}
       <p style="margin:0 0 4px;font-size:13px;color:#666;">${tabCount} coupon tabs</p>
@@ -302,8 +331,10 @@ async function sendCardEmail({ to, buyerName, tokens, merchantName, offerText, v
     ${cardBlocks}
 
     <p style="margin:22px 0 0;font-size:12px;color:#888;line-height:1.5;">
-      ${expiresOn ? `Valid through ${expiresOn}. ` : ''}Save this email — ${many ? 'these links are' : 'this link is'} how you open your ${many ? 'cards' : 'card'}.${many ? ' Each card is separate, so you can forward a link to whoever you are giving it to.' : ''}
-      At the register, tap a coupon to peel it, then hand your phone to the cashier.
+      ${expiresOn ? `Valid through ${expiresOn}. ` : ''}${isLicense
+        ? `Save this email — ${many ? 'these codes are' : 'this code is'} how you get in.${many ? ' Each code is separate, so you can pass one on.' : ''}`
+        : `Save this email — ${many ? 'these links are' : 'this link is'} how you open your ${many ? 'cards' : 'card'}.${many ? ' Each card is separate, so you can forward a link to whoever you are giving it to.' : ''}
+      At the register, tap a coupon to peel it, then hand your phone to the cashier.`}
     </p>
   </div>`;
 
