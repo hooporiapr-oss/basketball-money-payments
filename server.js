@@ -51,6 +51,33 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     return res.status(400).send('Invalid signature');
   }
 
+  // A pledge invoice being paid is the other thing worth listening for.
+  if (event.type === 'invoice.paid') {
+    const inv = event.data.object;
+    try {
+      await supabase
+        .from('pledges')
+        .update({ invoice_status: 'paid', paid_at: new Date().toISOString() })
+        .eq('stripe_invoice_id', inv.id);
+      console.log(`Pledge invoice ${inv.id} marked paid`);
+    } catch (e) {
+      console.error('Could not mark pledge paid:', e);
+      return res.status(500).send('Failed to record payment');
+    }
+    return res.status(200).send('ok');
+  }
+
+  if (event.type === 'invoice.payment_failed') {
+    const inv = event.data.object;
+    try {
+      await supabase
+        .from('pledges')
+        .update({ invoice_status: 'failed' })
+        .eq('stripe_invoice_id', inv.id);
+    } catch (e) { console.error('Could not mark pledge failed:', e); }
+    return res.status(200).send('ok');
+  }
+
   if (event.type !== 'checkout.session.completed') {
     return res.status(200).send('ok');
   }
@@ -289,6 +316,174 @@ app.post('/create-checkout-session', async (req, res) => {
     res.json({ url: session.url });
   } catch (e) {
     console.error('create-checkout-session error:', e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// ══════════════════════════════════════════════════════
+//  THE FORTRESS CHALLENGE — INVOICING
+//
+//  Pledges are promises, not payments. Once the official runs are in,
+//  this turns each pledge into a real Stripe invoice: the sponsor's
+//  rate times the points actually scored, payable in 30 days.
+//
+//  The amounts and the split are calculated HERE from the database,
+//  never from anything the browser sends — and frozen onto the pledge
+//  row, so changing a challenge's share later cannot rewrite what a
+//  sponsor was billed.
+//
+//  Only an admin can trigger this. The caller's Supabase token is
+//  verified against Supabase itself, then against the app_admins
+//  table — a signed-in coach or a stranger with the anon key gets a
+//  403, not an invoice run.
+// ══════════════════════════════════════════════════════
+
+async function requireAdmin(req) {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return null;
+
+  // Ask Supabase who this token belongs to.
+  const who = await fetch(`${process.env.SUPABASE_URL}/auth/v1/user`, {
+    headers: {
+      'apikey': process.env.SUPABASE_SERVICE_ROLE_KEY,
+      'Authorization': `Bearer ${token}`,
+    },
+  });
+  if (!who.ok) return null;
+
+  const user = await who.json();
+  if (!user || !user.email) return null;
+
+  const { data, error } = await supabase
+    .from('app_admins')
+    .select('email')
+    .ilike('email', user.email)
+    .limit(1);
+
+  if (error || !data || data.length === 0) return null;
+  return user.email;
+}
+
+app.post('/challenge-invoices', async (req, res) => {
+  const admin = await requireAdmin(req);
+  if (!admin) return res.status(403).json({ error: 'Not authorized' });
+
+  const { challenge_id } = req.body;
+  if (!challenge_id) return res.status(400).json({ error: 'challenge_id is required' });
+
+  try {
+    const { data: challenge, error: chErr } = await supabase
+      .from('challenges')
+      .select('id, name, team_share_pct, campaign_id, campaigns(name)')
+      .eq('id', challenge_id)
+      .single();
+
+    if (chErr || !challenge) return res.status(404).json({ error: 'Challenge not found' });
+
+    const { data: runs } = await supabase
+      .from('challenge_runs')
+      .select('player_id, points')
+      .eq('challenge_id', challenge_id);
+
+    const pointsByPlayer = {};
+    let teamPoints = 0;
+    (runs || []).forEach(r => {
+      pointsByPlayer[r.player_id] = r.points || 0;
+      teamPoints += r.points || 0;
+    });
+
+    const { data: pledges } = await supabase
+      .from('pledges')
+      .select('*, players(name)')
+      .eq('challenge_id', challenge_id);
+
+    const teamName = (challenge.campaigns && challenge.campaigns.name) || 'the team';
+    const results = { sent: 0, skipped: 0, zero: 0, failed: 0, errors: [] };
+
+    for (const p of pledges || []) {
+      // Already invoiced — never bill a sponsor twice.
+      if (p.stripe_invoice_id) { results.skipped++; continue; }
+
+      const points = p.player_id ? (pointsByPlayer[p.player_id] || 0) : teamPoints;
+
+      // No points means nothing owed. The pledge is closed out rather
+      // than left looking unfinished.
+      if (points <= 0) {
+        await supabase.from('pledges')
+          .update({ points_at_invoice: 0, amount: 0, team_amount: 0,
+                    platform_amount: 0, invoice_status: 'no_points' })
+          .eq('id', p.id);
+        results.zero++;
+        continue;
+      }
+
+      const amount = +(Number(p.rate_per_point) * points).toFixed(2);
+      const teamAmount = +(amount * (challenge.team_share_pct / 100)).toFixed(2);
+      const platformAmount = +(amount - teamAmount).toFixed(2);
+      const cents = Math.round(amount * 100);
+
+      if (cents < 50) {
+        // Stripe will not invoice below 50 cents, and chasing 30 cents
+        // costs more than it collects.
+        await supabase.from('pledges')
+          .update({ points_at_invoice: points, amount, team_amount: teamAmount,
+                    platform_amount: platformAmount, invoice_status: 'too_small' })
+          .eq('id', p.id);
+        results.zero++;
+        continue;
+      }
+
+      const who = p.player_id && p.players ? p.players.name : teamName;
+
+      try {
+        const customer = await stripe.customers.create({
+          name: p.sponsor_name,
+          email: p.sponsor_email,
+          metadata: { challenge_id, pledge_id: p.id },
+        });
+
+        await stripe.invoiceItems.create({
+          customer: customer.id,
+          currency: 'usd',
+          amount: cents,
+          description: `${challenge.name} — pledge of $${Number(p.rate_per_point).toFixed(2)} per point × ${points} points scored by ${who}`,
+        });
+
+        const invoice = await stripe.invoices.create({
+          customer: customer.id,
+          collection_method: 'send_invoice',
+          days_until_due: 30,
+          description: `Thank you for backing ${teamName}. Half of every dollar collected goes straight to the program.`,
+          metadata: { challenge_id, pledge_id: p.id, points: String(points) },
+        });
+
+        await stripe.invoices.sendInvoice(invoice.id);
+
+        await supabase.from('pledges')
+          .update({
+            points_at_invoice: points,
+            amount,
+            team_amount: teamAmount,
+            platform_amount: platformAmount,
+            stripe_invoice_id: invoice.id,
+            invoice_status: 'sent',
+            invoiced_at: new Date().toISOString(),
+          })
+          .eq('id', p.id);
+
+        results.sent++;
+      } catch (e) {
+        console.error(`Invoice failed for pledge ${p.id}:`, e.message);
+        results.failed++;
+        results.errors.push(`${p.sponsor_name}: ${e.message}`);
+      }
+    }
+
+    console.log(`Challenge ${challenge_id} invoicing —`, JSON.stringify(results));
+    res.json(results);
+  } catch (e) {
+    console.error('challenge-invoices error:', e);
     res.status(500).json({ error: String(e) });
   }
 });
