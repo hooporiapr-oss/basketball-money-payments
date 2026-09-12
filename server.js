@@ -158,6 +158,10 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         school_name: buyerName || 'Supporter',
         expires_at: c.expires_on,
         active: true,
+        // Sold licenses are device-capped; codes created by hand in
+        // the license admin stay unlimited, since those are used for
+        // recruiting schools and running free trials.
+        max_devices: 5,
         notes: 'Purchased through Basketball Money'
       }));
 
